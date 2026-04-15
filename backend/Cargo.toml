@@ -1,0 +1,3 @@
+[workspace]
+members = ["kmatrix-core", "kmatrix-server"]
+resolver = "2"
