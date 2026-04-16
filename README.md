@@ -7,7 +7,7 @@ Web-based automotive communication matrix (K-Matrix) search tool.
 ## Quick Start
 
 ```bash
-docker compose up
+podman compose up
 # Open http://localhost:3000
 ```
 
