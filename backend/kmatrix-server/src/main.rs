@@ -30,15 +30,19 @@ fn data_path() -> PathBuf {
 struct AppState {
     matrices: RwLock<Vec<KMatrix>>,
     index: RwLock<Vec<SearchHit>>,
+    /// Where to persist state. `None` disables persistence (used in tests).
+    persist_path: Option<PathBuf>,
 }
 
 impl AppState {
     /// Save current matrices to disk.
     fn persist(&self) {
+        let Some(ref path) = self.persist_path else {
+            return;
+        };
         let matrices = self.matrices.read().unwrap();
-        let path = data_path();
         if let Ok(json) = serde_json::to_vec(&*matrices) {
-            if let Err(e) = std::fs::write(&path, json) {
+            if let Err(e) = std::fs::write(path, json) {
                 tracing::warn!("Failed to persist state: {e}");
             } else {
                 tracing::info!("Persisted {} matrices to {}", matrices.len(), path.display());
@@ -77,9 +81,21 @@ async fn main() {
     let state = Arc::new(AppState {
         matrices: RwLock::new(loaded),
         index: RwLock::new(index),
+        persist_path: Some(data_path()),
     });
 
-    let app = Router::new()
+    let app = build_router(state);
+
+    let addr = "0.0.0.0:3001";
+    tracing::info!("K-Matrix Toolkit server listening on {addr}");
+
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+
+/// Build the application router with the given shared state.
+fn build_router(state: Arc<AppState>) -> Router {
+    Router::new()
         .route("/api/status", get(status))
         .route("/api/import", post(import_directory))
         .route("/api/upload", post(upload_files))
@@ -90,17 +106,12 @@ async fn main() {
         .route("/api/matrices/clear", post(clear_matrices))
         .layer(DefaultBodyLimit::max(500 * 1024 * 1024)) // 500 MB
         .layer(CorsLayer::permissive())
-        .with_state(state);
-
-    let addr = "0.0.0.0:3001";
-    tracing::info!("K-Matrix Toolkit server listening on {addr}");
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+        .with_state(state)
 }
 
 // ── Status ──────────────────────────────────────────────────────────
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct StatusResponse {
     matrix_count: usize,
     signal_count: usize,
@@ -126,7 +137,7 @@ struct ImportRequest {
     path: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct ImportResponse {
     files_imported: usize,
     total_matrices: usize,
@@ -321,14 +332,14 @@ struct SearchQuery {
     offset: Option<usize>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct FilterCounts {
     bus_types: std::collections::HashMap<String, usize>,
     platforms: std::collections::HashMap<String, usize>,
     file_types: std::collections::HashMap<String, usize>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct SearchResponse {
     query: String,
     total: usize,
@@ -436,7 +447,7 @@ async fn search_handler(
 
 // ── Filters ─────────────────────────────────────────────────────────
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct FiltersResponse {
     platforms: Vec<String>,
     bus_types: Vec<String>,
@@ -480,7 +491,7 @@ async fn filters_handler(State(state): State<Arc<AppState>>) -> Json<FiltersResp
 
 // ── List Matrices ───────────────────────────────────────────────────
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct MatrixSummary {
     id: String,
     source_file: String,
@@ -554,4 +565,388 @@ async fn clear_matrices(
     state.persist();
 
     Json(serde_json::json!({ "cleared": count }))
+}
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode as AxumStatusCode};
+    use bytes::Bytes;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    use chrono::Utc;
+    use kmatrix_core::{
+        BusType, EcuAssignment, EcuRole, FileFormat, KMatrix, Message, Platform, Signal,
+    };
+
+    /// Create a test AppState with no persistence and pre-populated data.
+    fn test_state(matrices: Vec<KMatrix>) -> Arc<AppState> {
+        let index = build_index(&matrices);
+        Arc::new(AppState {
+            matrices: RwLock::new(matrices),
+            index: RwLock::new(index),
+            persist_path: None,
+        })
+    }
+
+    /// Build a test KMatrix with known data.
+    fn make_test_matrix() -> KMatrix {
+        KMatrix {
+            id: uuid::Uuid::new_v4(),
+            source_file: "test_matrix.dbc".into(),
+            source_path: "/tmp/test_matrix.dbc".into(),
+            platform: Some(Platform::MLBevo2),
+            bus_type: BusType::CAN,
+            bus_name: "TEST_CAN01".into(),
+            format: FileFormat::DBC,
+            messages: vec![Message {
+                name: "TestMsg_01".into(),
+                identifier: Some("0x100".into()),
+                signals: vec![
+                    Signal {
+                        name: "SIG_CRC".into(),
+                        comment: Some("CRC checksum".into()),
+                        description: None,
+                        init_value: Some("0".into()),
+                        error_value: None,
+                        min_raw: Some("0".into()),
+                        max_raw: Some("255".into()),
+                        physical_value: None,
+                        unit: None,
+                        offset: Some("0".into()),
+                        scaling: Some("1".into()),
+                        raw_value: None,
+                        start_bit: Some(0),
+                        bit_length: Some(8),
+                    },
+                    Signal {
+                        name: "SIG_Speed".into(),
+                        comment: Some("Vehicle speed".into()),
+                        description: None,
+                        init_value: None,
+                        error_value: None,
+                        min_raw: Some("0".into()),
+                        max_raw: Some("65535".into()),
+                        physical_value: None,
+                        unit: Some("km/h".into()),
+                        offset: Some("0".into()),
+                        scaling: Some("0.01".into()),
+                        raw_value: None,
+                        start_bit: Some(8),
+                        bit_length: Some(16),
+                    },
+                ],
+                ecu_assignments: vec![
+                    EcuAssignment {
+                        ecu_name: "ECU_A".into(),
+                        role: EcuRole::Sender,
+                    },
+                    EcuAssignment {
+                        ecu_name: "ECU_B".into(),
+                        role: EcuRole::Receiver,
+                    },
+                ],
+            }],
+            parsed_at: Utc::now(),
+        }
+    }
+
+    /// Send a GET request and return the response body bytes.
+    async fn get_body(app: Router, uri: &str) -> (AxumStatusCode, Bytes) {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, body)
+    }
+
+    /// Send a POST request with JSON body and return the response.
+    async fn post_json(app: Router, uri: &str, json: &str) -> (AxumStatusCode, Bytes) {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(json.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, body)
+    }
+
+    /// Send a DELETE request.
+    async fn delete_req(app: Router, uri: &str) -> (AxumStatusCode, Bytes) {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, body)
+    }
+
+    // ── GET /api/status ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn status_empty() {
+        let state = test_state(vec![]);
+        let app = build_router(state);
+        let (status, body) = get_body(app, "/api/status").await;
+
+        assert_eq!(status, AxumStatusCode::OK);
+        let resp: StatusResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.matrix_count, 0);
+        assert_eq!(resp.signal_count, 0);
+    }
+
+    #[tokio::test]
+    async fn status_with_data() {
+        let state = test_state(vec![make_test_matrix()]);
+        let app = build_router(state);
+        let (status, body) = get_body(app, "/api/status").await;
+
+        assert_eq!(status, AxumStatusCode::OK);
+        let resp: StatusResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.matrix_count, 1);
+        assert_eq!(resp.signal_count, 2);
+    }
+
+    // ── GET /api/filters ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn filters_empty() {
+        let state = test_state(vec![]);
+        let app = build_router(state);
+        let (status, body) = get_body(app, "/api/filters").await;
+
+        assert_eq!(status, AxumStatusCode::OK);
+        let resp: FiltersResponse = serde_json::from_slice(&body).unwrap();
+        assert!(resp.platforms.is_empty());
+        assert!(resp.bus_types.is_empty());
+        assert!(resp.file_types.is_empty());
+    }
+
+    #[tokio::test]
+    async fn filters_with_data() {
+        let state = test_state(vec![make_test_matrix()]);
+        let app = build_router(state);
+        let (status, body) = get_body(app, "/api/filters").await;
+
+        assert_eq!(status, AxumStatusCode::OK);
+        let resp: FiltersResponse = serde_json::from_slice(&body).unwrap();
+        assert!(resp.platforms.contains(&"MLBevo 2".to_string()));
+        assert!(resp.bus_types.contains(&"CAN".to_string()));
+        assert!(resp.file_types.contains(&"dbc".to_string()));
+    }
+
+    // ── GET /api/matrices ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_matrices_empty() {
+        let state = test_state(vec![]);
+        let app = build_router(state);
+        let (status, body) = get_body(app, "/api/matrices").await;
+
+        assert_eq!(status, AxumStatusCode::OK);
+        let resp: Vec<MatrixSummary> = serde_json::from_slice(&body).unwrap();
+        assert!(resp.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_matrices_with_data() {
+        let state = test_state(vec![make_test_matrix()]);
+        let app = build_router(state);
+        let (status, body) = get_body(app, "/api/matrices").await;
+
+        assert_eq!(status, AxumStatusCode::OK);
+        let resp: Vec<MatrixSummary> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.len(), 1);
+        assert_eq!(resp[0].source_file, "test_matrix.dbc");
+        assert_eq!(resp[0].bus_type, "CAN");
+        assert_eq!(resp[0].bus_name, "TEST_CAN01");
+        assert_eq!(resp[0].message_count, 1);
+        assert_eq!(resp[0].signal_count, 2);
+    }
+
+    // ── GET /api/search ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn search_empty_query_returns_all() {
+        let state = test_state(vec![make_test_matrix()]);
+        let app = build_router(state);
+        let (status, body) = get_body(app, "/api/search").await;
+
+        assert_eq!(status, AxumStatusCode::OK);
+        let resp: SearchResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.total, 2); // 2 signals
+        assert_eq!(resp.results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn search_by_signal_name() {
+        let state = test_state(vec![make_test_matrix()]);
+        let app = build_router(state);
+        let (status, body) = get_body(app, "/api/search?q=CRC").await;
+
+        assert_eq!(status, AxumStatusCode::OK);
+        let resp: SearchResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.total, 1);
+        assert_eq!(resp.results[0].signal_name, "SIG_CRC");
+    }
+
+    #[tokio::test]
+    async fn search_case_insensitive() {
+        let state = test_state(vec![make_test_matrix()]);
+        let app = build_router(state);
+        let (_, body) = get_body(app, "/api/search?q=speed").await;
+
+        let resp: SearchResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.total, 1);
+        assert_eq!(resp.results[0].signal_name, "SIG_Speed");
+    }
+
+    #[tokio::test]
+    async fn search_pagination() {
+        let state = test_state(vec![make_test_matrix()]);
+        let app = build_router(state);
+        let (_, body) = get_body(app, "/api/search?limit=1&offset=0").await;
+
+        let resp: SearchResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.total, 2); // total is 2
+        assert_eq!(resp.results.len(), 1); // but only 1 returned
+        assert_eq!(resp.limit, 1);
+        assert_eq!(resp.offset, 0);
+    }
+
+    #[tokio::test]
+    async fn search_pagination_offset() {
+        let state = test_state(vec![make_test_matrix()]);
+        let app = build_router(state);
+        let (_, body) = get_body(app, "/api/search?limit=1&offset=1").await;
+
+        let resp: SearchResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.total, 2);
+        assert_eq!(resp.results.len(), 1);
+        assert_eq!(resp.offset, 1);
+    }
+
+    #[tokio::test]
+    async fn search_with_bus_filter() {
+        let state = test_state(vec![make_test_matrix()]);
+        let app = build_router(state);
+        // Filter for LIN — should return nothing (test data is CAN)
+        let (_, body) = get_body(app, "/api/search?bus=LIN").await;
+        let resp: SearchResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.total, 0);
+    }
+
+    #[tokio::test]
+    async fn search_filter_counts() {
+        let state = test_state(vec![make_test_matrix()]);
+        let app = build_router(state);
+        let (_, body) = get_body(app, "/api/search").await;
+
+        let resp: SearchResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(*resp.filter_counts.bus_types.get("CAN").unwrap_or(&0), 2);
+        assert_eq!(
+            *resp.filter_counts.platforms.get("MLBevo 2").unwrap_or(&0),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn search_no_results() {
+        let state = test_state(vec![make_test_matrix()]);
+        let app = build_router(state);
+        let (_, body) = get_body(app, "/api/search?q=NONEXISTENT_SIGNAL_XYZ").await;
+
+        let resp: SearchResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.total, 0);
+        assert!(resp.results.is_empty());
+    }
+
+    // ── DELETE /api/matrices/:id ────────────────────────────────────
+
+    #[tokio::test]
+    async fn delete_matrix_success() {
+        let km = make_test_matrix();
+        let km_id = km.id.to_string();
+        let state = test_state(vec![km]);
+        let app = build_router(state);
+
+        let (status, body) = delete_req(app, &format!("/api/matrices/{km_id}")).await;
+        assert_eq!(status, AxumStatusCode::OK);
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["removed"], 1);
+    }
+
+    #[tokio::test]
+    async fn delete_matrix_not_found() {
+        let state = test_state(vec![make_test_matrix()]);
+        let app = build_router(state);
+        let fake_id = uuid::Uuid::new_v4();
+
+        let (status, _) = delete_req(app, &format!("/api/matrices/{fake_id}")).await;
+        assert_eq!(status, AxumStatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn delete_matrix_invalid_uuid() {
+        let state = test_state(vec![]);
+        let app = build_router(state);
+
+        let (status, _) = delete_req(app, "/api/matrices/not-a-uuid").await;
+        assert_eq!(status, AxumStatusCode::BAD_REQUEST);
+    }
+
+    // ── POST /api/matrices/clear ────────────────────────────────────
+
+    #[tokio::test]
+    async fn clear_matrices_success() {
+        let state = test_state(vec![make_test_matrix()]);
+        let app = build_router(state);
+
+        let (status, body) = post_json(app, "/api/matrices/clear", "").await;
+        assert_eq!(status, AxumStatusCode::OK);
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["cleared"], 1);
+    }
+
+    // ── POST /api/import (error cases) ──────────────────────────────
+
+    #[tokio::test]
+    async fn import_nonexistent_path() {
+        let state = test_state(vec![]);
+        let app = build_router(state);
+
+        let (status, _) = post_json(
+            app,
+            "/api/import",
+            r#"{"path": "/nonexistent/path/to/kmatrix"}"#,
+        )
+        .await;
+        assert_eq!(status, AxumStatusCode::BAD_REQUEST);
+    }
 }

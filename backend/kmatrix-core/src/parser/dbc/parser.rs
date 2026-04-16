@@ -121,3 +121,176 @@ pub fn parse_dbc(path: &Path) -> Result<Vec<KMatrix>> {
         parsed_at: Utc::now(),
     }])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Minimal valid DBC content with one message and two signals.
+    const MINIMAL_DBC: &str = r#"
+VERSION ""
+
+NS_ :
+
+BS_:
+
+BU_: ECU1 ECU2
+
+BO_ 256 TestMsg: 8 ECU1
+ SG_ CRC_Signal : 0|8@1+ (1,0) [0|255] "unit" ECU2
+ SG_ Counter_Signal : 8|4@1+ (1,0) [0|15] "" ECU1,ECU2
+
+"#;
+
+    /// DBC content with Vector__XXX placeholder receiver (should be filtered out).
+    const DBC_WITH_VECTOR_XXX: &str = r#"
+VERSION ""
+
+NS_ :
+
+BS_:
+
+BU_: Sender1
+
+BO_ 512 Msg_A: 8 Sender1
+ SG_ Sig_X : 0|8@1+ (0.5,10) [0|127.5] "km/h" Vector__XXX
+
+"#;
+
+    fn write_temp_dbc(content: &str, name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn parse_minimal_dbc() {
+        let (_dir, path) = write_temp_dbc(MINIMAL_DBC, "test.dbc");
+        let matrices = parse_dbc(&path).expect("should parse minimal DBC");
+
+        assert_eq!(matrices.len(), 1);
+        let km = &matrices[0];
+        assert_eq!(km.format, FileFormat::DBC);
+        assert!(!km.messages.is_empty());
+    }
+
+    #[test]
+    fn dbc_message_id_is_hex() {
+        let (_dir, path) = write_temp_dbc(MINIMAL_DBC, "test.dbc");
+        let matrices = parse_dbc(&path).unwrap();
+        let msg = &matrices[0].messages[0];
+
+        assert_eq!(msg.name, "TestMsg");
+        // 256 decimal = 0x100
+        assert_eq!(msg.identifier, Some("0x100".into()));
+    }
+
+    #[test]
+    fn dbc_signal_properties_extracted() {
+        let (_dir, path) = write_temp_dbc(MINIMAL_DBC, "test.dbc");
+        let matrices = parse_dbc(&path).unwrap();
+        let msg = &matrices[0].messages[0];
+
+        let crc = msg.signals.iter().find(|s| s.name == "CRC_Signal").unwrap();
+        assert_eq!(crc.start_bit, Some(0));
+        assert_eq!(crc.bit_length, Some(8));
+        assert_eq!(crc.scaling, Some("1".into()));
+        assert_eq!(crc.offset, Some("0".into()));
+        assert_eq!(crc.min_raw, Some("0".into()));
+        assert_eq!(crc.max_raw, Some("255".into()));
+        assert_eq!(crc.unit, Some("unit".into()));
+
+        let counter = msg.signals.iter().find(|s| s.name == "Counter_Signal").unwrap();
+        assert_eq!(counter.start_bit, Some(8));
+        assert_eq!(counter.bit_length, Some(4));
+    }
+
+    #[test]
+    fn dbc_sender_ecu_extracted() {
+        let (_dir, path) = write_temp_dbc(MINIMAL_DBC, "test.dbc");
+        let matrices = parse_dbc(&path).unwrap();
+        let msg = &matrices[0].messages[0];
+
+        let sender = msg.ecu_assignments.iter().find(|a| a.role == EcuRole::Sender);
+        assert!(sender.is_some());
+        assert_eq!(sender.unwrap().ecu_name, "ECU1");
+    }
+
+    #[test]
+    fn dbc_receiver_ecus_extracted() {
+        let (_dir, path) = write_temp_dbc(MINIMAL_DBC, "test.dbc");
+        let matrices = parse_dbc(&path).unwrap();
+        let msg = &matrices[0].messages[0];
+
+        let receivers: Vec<&str> = msg
+            .ecu_assignments
+            .iter()
+            .filter(|a| a.role == EcuRole::Receiver)
+            .map(|a| a.ecu_name.as_str())
+            .collect();
+        assert!(receivers.contains(&"ECU2"));
+    }
+
+    #[test]
+    fn dbc_skips_vector_xxx_receiver() {
+        let (_dir, path) = write_temp_dbc(DBC_WITH_VECTOR_XXX, "vec_test.dbc");
+        let matrices = parse_dbc(&path).unwrap();
+        let msg = &matrices[0].messages[0];
+
+        let receivers: Vec<&str> = msg
+            .ecu_assignments
+            .iter()
+            .filter(|a| a.role == EcuRole::Receiver)
+            .map(|a| a.ecu_name.as_str())
+            .collect();
+        assert!(
+            !receivers.contains(&"Vector__XXX"),
+            "Vector__XXX placeholder should be filtered out"
+        );
+    }
+
+    #[test]
+    fn dbc_signal_with_factor_and_offset() {
+        let (_dir, path) = write_temp_dbc(DBC_WITH_VECTOR_XXX, "factor_test.dbc");
+        let matrices = parse_dbc(&path).unwrap();
+        let sig = &matrices[0].messages[0].signals[0];
+
+        assert_eq!(sig.name, "Sig_X");
+        assert_eq!(sig.scaling, Some("0.5".into()));
+        assert_eq!(sig.offset, Some("10".into()));
+        assert_eq!(sig.unit, Some("km/h".into()));
+    }
+
+    #[test]
+    fn dbc_empty_unit_becomes_none() {
+        let (_dir, path) = write_temp_dbc(MINIMAL_DBC, "unit_test.dbc");
+        let matrices = parse_dbc(&path).unwrap();
+        let msg = &matrices[0].messages[0];
+        let counter = msg.signals.iter().find(|s| s.name == "Counter_Signal").unwrap();
+        assert_eq!(counter.unit, None); // empty string unit → None
+    }
+
+    #[test]
+    fn dbc_nonexistent_file_returns_error() {
+        let result = parse_dbc(Path::new("/nonexistent/file.dbc"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn dbc_metadata_from_path() {
+        let dir = tempfile::tempdir().unwrap();
+        // Path containing "MLBevo" and "CAN" should be detected
+        let subdir = dir.path().join("MLBevo 2/K-Matrix/CAN");
+        std::fs::create_dir_all(&subdir).unwrap();
+        let path = subdir.join("MLBevo_Gen2_Test_KCAN_KMatrix.dbc");
+        std::fs::write(&path, MINIMAL_DBC).unwrap();
+
+        let matrices = parse_dbc(&path).unwrap();
+        let km = &matrices[0];
+        assert!(matches!(km.platform, Some(crate::model::Platform::MLBevo2)));
+        assert_eq!(km.bus_type, crate::model::BusType::CAN);
+    }
+}

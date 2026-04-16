@@ -227,3 +227,212 @@ fn find_data_start_row(header_rows: &[Vec<Option<String>>]) -> usize {
     }
     4
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: create a cell value.
+    fn s(val: &str) -> Option<String> {
+        Some(val.to_string())
+    }
+
+    // ── build_column_map ────────────────────────────────────────────
+
+    #[test]
+    fn build_column_map_typical_canfd() {
+        // Simulates a real CAN FD K-Matrix header structure.
+        let row0 = vec![
+            s("Botschaften"), None, s("Signale"), None, None, None,
+            s("Wertebereich"), None, None, None,
+            s("Sender - Empfänger"), None, None,
+        ];
+        let row1 = vec![
+            s("Botschaft"), s("Identifier [hex]"),
+            s("Signal"), s("StartBit"), s("Signal Länge [Bits]"), s("Signalkommentar"),
+            s("Min Rohwert [dez]"), s("Max Rohwert [dez]"), s("phy Werte [dez]"), s("Einheit"),
+            s("HCP1"), s("Gateway"), s("BCM2"),
+        ];
+        let row2: Vec<Option<String>> = vec![
+            None, None, None, None, None, None,
+            s("Min Rohwert [dez]"), s("Max Rohwert [dez]"), s("phy Werte [dez]"), s("Einheit"),
+            None, None, None,
+        ];
+        let row3: Vec<Option<String>> = vec![None; 13];
+
+        let col_map = build_column_map(&[row0, row1, row2, row3]);
+
+        assert_eq!(col_map.mapping[&0], MappedField::MessageName);
+        assert_eq!(col_map.mapping[&1], MappedField::IdentifierHex);
+        assert_eq!(col_map.mapping[&2], MappedField::SignalName);
+        assert_eq!(col_map.mapping[&3], MappedField::StartBit);
+        assert_eq!(col_map.mapping[&4], MappedField::BitLength);
+        assert_eq!(col_map.mapping[&5], MappedField::SignalComment);
+        assert_eq!(col_map.mapping[&6], MappedField::MinRaw);
+        assert_eq!(col_map.mapping[&7], MappedField::MaxRaw);
+        assert_eq!(col_map.mapping[&8], MappedField::PhysicalValue);
+        assert_eq!(col_map.mapping[&9], MappedField::Unit);
+        assert_eq!(col_map.mapping[&10], MappedField::EcuColumn("HCP1".into()));
+        assert_eq!(col_map.mapping[&11], MappedField::EcuColumn("Gateway".into()));
+        assert_eq!(col_map.mapping[&12], MappedField::EcuColumn("BCM2".into()));
+        assert_eq!(col_map.data_start_row, 4);
+    }
+
+    #[test]
+    fn build_column_map_fewer_than_3_rows() {
+        let row0 = vec![s("Botschaften")];
+        let row1 = vec![s("Botschaft")];
+        let col_map = build_column_map(&[row0, row1]);
+
+        assert!(col_map.mapping.is_empty());
+        assert_eq!(col_map.data_start_row, 0);
+    }
+
+    #[test]
+    fn data_start_row_with_content_in_row3() {
+        let row0 = vec![s("Botschaften")];
+        let row1 = vec![s("Botschaft")];
+        let row2 = vec![None];
+        let row3 = vec![s("SomeData")]; // row 3 has content → start at 3
+
+        let col_map = build_column_map(&[row0, row1, row2, row3]);
+        assert_eq!(col_map.data_start_row, 3);
+    }
+
+    #[test]
+    fn data_start_row_empty_row3() {
+        let row0 = vec![s("Botschaften")];
+        let row1 = vec![s("Botschaft")];
+        let row2 = vec![None];
+        let row3: Vec<Option<String>> = vec![None]; // row 3 empty → start at 4
+
+        let col_map = build_column_map(&[row0, row1, row2, row3]);
+        assert_eq!(col_map.data_start_row, 4);
+    }
+
+    // ── map_column_name (message-level) ─────────────────────────────
+
+    #[test]
+    fn message_name_variants() {
+        assert_eq!(map_column_name("Botschaft", "", false), MappedField::MessageName);
+        assert_eq!(map_column_name("Botschaften", "", false), MappedField::MessageName);
+        assert_eq!(map_column_name("PDU", "", false), MappedField::MessageName);
+        assert_eq!(map_column_name("Frame", "", false), MappedField::MessageName);
+    }
+
+    #[test]
+    fn identifier_hex_variants() {
+        assert_eq!(map_column_name("Identifier [hex]", "", false), MappedField::IdentifierHex);
+        assert_eq!(map_column_name("PDU-ID [hex]", "", false), MappedField::IdentifierHex);
+    }
+
+    // ── map_column_name (signal-level) ──────────────────────────────
+
+    #[test]
+    fn signal_field_names() {
+        assert_eq!(map_column_name("Signal", "", false), MappedField::SignalName);
+        assert_eq!(map_column_name("Signale", "", false), MappedField::SignalName);
+        assert_eq!(map_column_name("StartBit", "", false), MappedField::StartBit);
+        assert_eq!(map_column_name("Signal Länge [Bits]", "", false), MappedField::BitLength);
+        assert_eq!(map_column_name("InitWert roh [dez]", "", false), MappedField::InitValue);
+        assert_eq!(map_column_name("FehlerWert roh [dez]", "", false), MappedField::ErrorValue);
+        assert_eq!(map_column_name("Signalkommentar", "", false), MappedField::SignalComment);
+    }
+
+    #[test]
+    fn unknown_column_is_ignored() {
+        assert_eq!(map_column_name("SomeRandomColumn", "", false), MappedField::Ignored);
+    }
+
+    // ── map_value_range_sub_header (Wertebereich) ───────────────────
+
+    #[test]
+    fn wertebereich_sub_headers() {
+        assert_eq!(map_value_range_sub_header("Min Rohwert [dez]", ""), MappedField::MinRaw);
+        assert_eq!(map_value_range_sub_header("Max Rohwert [dez]", ""), MappedField::MaxRaw);
+        assert_eq!(map_value_range_sub_header("phy Werte [dez]", ""), MappedField::PhysicalValue);
+        assert_eq!(map_value_range_sub_header("phy. Werte [dez]", ""), MappedField::PhysicalValue);
+        assert_eq!(map_value_range_sub_header("Einheit", ""), MappedField::Unit);
+        assert_eq!(map_value_range_sub_header("Offset", ""), MappedField::Offset);
+        assert_eq!(map_value_range_sub_header("Skalierung", ""), MappedField::Scaling);
+        assert_eq!(map_value_range_sub_header("Rohwert [dez]", ""), MappedField::RawValue);
+        assert_eq!(map_value_range_sub_header("Beschreibung", ""), MappedField::Description);
+    }
+
+    #[test]
+    fn wertebereich_falls_back_to_col_name() {
+        // When sub_name is empty, uses col_name instead
+        assert_eq!(map_value_range_sub_header("", "Min Rohwert [dez]"), MappedField::MinRaw);
+        assert_eq!(map_value_range_sub_header("", "Einheit"), MappedField::Unit);
+    }
+
+    #[test]
+    fn wertebereich_unknown_is_ignored() {
+        assert_eq!(map_value_range_sub_header("SomethingElse", ""), MappedField::Ignored);
+    }
+
+    // ── map_column_name delegates to Wertebereich ───────────────────
+
+    #[test]
+    fn in_wertebereich_uses_sub_header() {
+        // When in_wertebereich=true, sub_name is used for mapping
+        assert_eq!(
+            map_column_name("SomeGroup", "Min Rohwert [dez]", true),
+            MappedField::MinRaw
+        );
+        assert_eq!(
+            map_column_name("SomeGroup", "Einheit", true),
+            MappedField::Unit
+        );
+    }
+
+    // ── Direct min/max rohwert outside Wertebereich ─────────────────
+
+    #[test]
+    fn min_max_rohwert_outside_wertebereich() {
+        assert_eq!(
+            map_column_name("Min Rohwert [dez]", "", false),
+            MappedField::MinRaw
+        );
+        assert_eq!(
+            map_column_name("Max Rohwert [dez]", "", false),
+            MappedField::MaxRaw
+        );
+        // Also via sub_name
+        assert_eq!(
+            map_column_name("SomeCol", "Min Rohwert [dez]", false),
+            MappedField::MinRaw
+        );
+    }
+
+    // ── ECU column detection in build_column_map ────────────────────
+
+    #[test]
+    fn ecu_columns_only_in_sender_receiver_group() {
+        let row0 = vec![s("Sender - Empfänger"), None, None];
+        let row1 = vec![s("ECU_A"), s("ECU_B"), s("ECU_C")];
+        let row2: Vec<Option<String>> = vec![None, None, None];
+        let row3: Vec<Option<String>> = vec![None, None, None];
+
+        let col_map = build_column_map(&[row0, row1, row2, row3]);
+
+        assert_eq!(col_map.mapping[&0], MappedField::EcuColumn("ECU_A".into()));
+        assert_eq!(col_map.mapping[&1], MappedField::EcuColumn("ECU_B".into()));
+        assert_eq!(col_map.mapping[&2], MappedField::EcuColumn("ECU_C".into()));
+    }
+
+    #[test]
+    fn empty_ecu_column_name_is_ignored() {
+        // If an ECU column has no name in row1, it should NOT become EcuColumn("")
+        let row0 = vec![s("Sender - Empfänger"), None];
+        let row1 = vec![s("ECU_A"), None]; // second col has no name
+        let row2: Vec<Option<String>> = vec![None, None];
+        let row3: Vec<Option<String>> = vec![None, None];
+
+        let col_map = build_column_map(&[row0, row1, row2, row3]);
+
+        assert_eq!(col_map.mapping[&0], MappedField::EcuColumn("ECU_A".into()));
+        // col 1 should be Ignored (empty col_name in sender-receiver group)
+        assert_eq!(col_map.mapping[&1], MappedField::Ignored);
+    }
+}
