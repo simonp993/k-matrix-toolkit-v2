@@ -5,7 +5,6 @@ import {
   useCallback,
   useRef,
   useEffect,
-  useMemo,
   DragEvent,
   MouseEvent as RMouseEvent,
 } from "react";
@@ -48,6 +47,15 @@ function fileTypeFromSource(src: string): string {
 
 const ALL_COLUMNS: ColumnDef[] = [
   {
+    key: "message_name",
+    label: "Message (Botschaft)",
+    minWidth: 130,
+    defaultWidth: 180,
+    defaultVisible: true,
+    accessor: (h) => h.message_name,
+    render: (h) => <span className="font-mono">{h.message_name}</span>,
+  },
+  {
     key: "signal_name",
     label: "Signal",
     minWidth: 120,
@@ -55,15 +63,6 @@ const ALL_COLUMNS: ColumnDef[] = [
     defaultVisible: true,
     accessor: (h) => h.signal_name,
     render: (h) => <span className="font-mono font-medium">{h.signal_name}</span>,
-  },
-  {
-    key: "message_name",
-    label: "Message",
-    minWidth: 130,
-    defaultWidth: 160,
-    defaultVisible: true,
-    accessor: (h) => h.message_name,
-    render: (h) => <span className="font-mono">{h.message_name}</span>,
   },
   {
     key: "identifier",
@@ -332,16 +331,37 @@ export default function SearchPage() {
   const [allColumnValues, setAllColumnValues] = useState<Record<string, string[]>>({});
 
   const debounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const filterDebounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const filterMounted = useRef(false);
   const searchVersion = useRef(0);
+
+  /* -- Build column filter params for backend ------------------------- */
+
+  const buildColumnFilterParams = useCallback(() => {
+    const textFilters: Record<string, string> = {};
+    for (const [k, v] of Object.entries(columnTextFilters)) {
+      if (v.trim()) textFilters[k] = v;
+    }
+    const setFilters: Record<string, string[]> = {};
+    for (const [k, v] of Object.entries(columnSetFilters)) {
+      // Only send if not all values are selected (i.e. it's actually filtering)
+      const allVals = allColumnValues[k];
+      if (allVals && v.size < allVals.length) {
+        setFilters[k] = Array.from(v);
+      }
+    }
+    const hasAny = Object.keys(textFilters).length > 0 || Object.keys(setFilters).length > 0;
+    return hasAny ? { textFilters, setFilters } : undefined;
+  }, [columnTextFilters, columnSetFilters, allColumnValues]);
 
   /* -- Search --------------------------------------------------------- */
 
   const doSearch = useCallback(
-    async (q: string, newOffset: number) => {
+    async (q: string, newOffset: number, colFilters?: { textFilters?: Record<string, string>; setFilters?: Record<string, string[]> }) => {
       const version = ++searchVersion.current;
       setSearching(true);
       try {
-        const res = await searchSignals(q.trim(), {}, { limit: PAGE_SIZE, offset: newOffset });
+        const res = await searchSignals(q.trim(), {}, { limit: PAGE_SIZE, offset: newOffset }, colFilters);
         if (version === searchVersion.current) {
           setResults(res.results);
           setTotalResults(res.total);
@@ -376,16 +396,33 @@ export default function SearchPage() {
       const val = e.target.value;
       setQuery(val);
       if (debounceTimer.current) clearTimeout(debounceTimer.current);
-      debounceTimer.current = setTimeout(() => doSearch(val, 0), 300);
+      debounceTimer.current = setTimeout(() => doSearch(val, 0, buildColumnFilterParams()), 300);
     },
-    [doSearch]
+    [doSearch, buildColumnFilterParams]
   );
+
+  /* -- Re-search when column filters change (reset to page 1) -------- */
+
+  useEffect(() => {
+    // Skip the initial render (doSearch is already called on mount)
+    if (!filterMounted.current) {
+      filterMounted.current = true;
+      return;
+    }
+    if (filterDebounceTimer.current !== null) {
+      clearTimeout(filterDebounceTimer.current);
+    }
+    filterDebounceTimer.current = setTimeout(() => {
+      doSearch(query, 0, buildColumnFilterParams());
+    }, 300);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [columnTextFilters, columnSetFilters]);
 
   /* -- Unique values per column from ALL results (backend) ------------ */
 
   const uniqueValuesPerColumn = allColumnValues;
 
-  /* -- Column filtering ----------------------------------------------- */
+  /* -- Column filtering (now handled server-side) --------------------- */
 
   const activeTextFilters = Object.entries(columnTextFilters).filter(([, v]) => v.trim() !== "");
   const activeSetFilters = Object.entries(columnSetFilters).filter(
@@ -393,26 +430,6 @@ export default function SearchPage() {
   );
 
   const hasAnyFilter = activeTextFilters.length > 0 || activeSetFilters.length > 0;
-
-  const filteredResults = useMemo(() => {
-    if (!hasAnyFilter) return results;
-    return results.filter((hit) => {
-      // Text filters
-      for (const [colKey, fv] of activeTextFilters) {
-        const col = ALL_COLUMNS.find((c) => c.key === colKey);
-        if (!col) continue;
-        if (!col.accessor(hit).toLowerCase().includes(fv.toLowerCase())) return false;
-      }
-      // Set filters
-      for (const [colKey, checked] of activeSetFilters) {
-        const col = ALL_COLUMNS.find((c) => c.key === colKey);
-        if (!col) continue;
-        const v = col.accessor(hit);
-        if (!checked.has(v)) return false;
-      }
-      return true;
-    });
-  }, [results, activeTextFilters, activeSetFilters, hasAnyFilter]);
 
   /* -- Column visibility handler -------------------------------------- */
 
@@ -499,7 +516,6 @@ export default function SearchPage() {
 
   const totalPages = Math.ceil(totalResults / PAGE_SIZE);
   const currentPage = Math.floor(offset / PAGE_SIZE) + 1;
-  const hiddenByColFilter = results.length - filteredResults.length;
 
   // Table: fill available space, but scroll horizontally when columns exceed viewport
   const totalColWidth = orderedVisibleColumns.reduce((sum, col) => sum + columnWidths[col.key], 0);
@@ -567,7 +583,6 @@ export default function SearchPage() {
               {totalResults.toLocaleString()} result{totalResults === 1 ? "" : "s"}
               {totalResults > PAGE_SIZE &&
                 ` \u2014 showing ${offset + 1}\u2013${Math.min(offset + PAGE_SIZE, totalResults)}`}
-              {hiddenByColFilter > 0 && ` (${hiddenByColFilter} hidden by column filters)`}
               {searching && " \u00b7 searching\u2026"}
             </PText>
           )}
@@ -666,7 +681,7 @@ export default function SearchPage() {
                 </tr>
               </thead>
               <tbody>
-                {filteredResults.map((hit, idx) => (
+                {results.map((hit, idx) => (
                   <tr key={`${hit.matrix_id}-${hit.signal_name}-${idx}`}
                     className="border-b border-gray-100 hover:bg-gray-50">
                     {orderedVisibleColumns.map((col) => (
@@ -676,14 +691,6 @@ export default function SearchPage() {
                     ))}
                   </tr>
                 ))}
-                {filteredResults.length === 0 && results.length > 0 && (
-                  <tr>
-                    <td colSpan={orderedVisibleColumns.length}
-                      className="px-3 py-6 text-center text-gray-400">
-                      All rows hidden by column filters
-                    </td>
-                  </tr>
-                )}
               </tbody>
             </table>
           </div>
@@ -692,12 +699,12 @@ export default function SearchPage() {
           {totalPages > 1 && (
             <div className="flex items-center justify-center gap-4 mt-4">
               <PButton variant="tertiary" disabled={currentPage <= 1}
-                onClick={() => doSearch(query, offset - PAGE_SIZE)}>
+                onClick={() => doSearch(query, offset - PAGE_SIZE, buildColumnFilterParams())}>
                 &larr; Previous
               </PButton>
               <PText>Page {currentPage} of {totalPages}</PText>
               <PButton variant="tertiary" disabled={currentPage >= totalPages}
-                onClick={() => doSearch(query, offset + PAGE_SIZE)}>
+                onClick={() => doSearch(query, offset + PAGE_SIZE, buildColumnFilterParams())}>
                 Next &rarr;
               </PButton>
             </div>

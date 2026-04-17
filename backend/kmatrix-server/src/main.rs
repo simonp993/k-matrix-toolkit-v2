@@ -330,6 +330,10 @@ struct SearchQuery {
     file_type: Option<String>,
     limit: Option<usize>,
     offset: Option<usize>,
+    /// JSON: {"column_key": "search_text", ...}
+    col_text_filters: Option<String>,
+    /// JSON: {"column_key": ["val1", "val2"], ...}
+    col_set_filters: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -350,6 +354,34 @@ struct SearchResponse {
     column_values: std::collections::HashMap<String, Vec<String>>,
 }
 
+/// Get a field value from a SearchHit by column key string.
+fn get_hit_field(hit: &SearchHit, key: &str) -> String {
+    match key {
+        "signal_name" => hit.signal_name.clone(),
+        "message_name" => hit.message_name.clone(),
+        "identifier" => hit.identifier.clone().unwrap_or_default(),
+        "bus_type" => hit.bus_type.clone(),
+        "bus_name" => hit.bus_name.clone(),
+        "file_type" => hit.source_file.rsplit('.').next().unwrap_or("").to_lowercase(),
+        "start_bit" => hit.start_bit.map(|v| v.to_string()).unwrap_or_default(),
+        "bit_length" => hit.bit_length.map(|v| v.to_string()).unwrap_or_default(),
+        "ecu_sender" => hit.ecu_sender.clone().unwrap_or_default(),
+        "ecu_receivers" => hit.ecu_receivers.join(", "),
+        "comment" => hit.comment.clone().unwrap_or_default(),
+        "description" => hit.description.clone().unwrap_or_default(),
+        "init_value" => hit.init_value.clone().unwrap_or_default(),
+        "error_value" => hit.error_value.clone().unwrap_or_default(),
+        "min_raw" => hit.min_raw.clone().unwrap_or_default(),
+        "max_raw" => hit.max_raw.clone().unwrap_or_default(),
+        "physical_value" => hit.physical_value.clone().unwrap_or_default(),
+        "unit" => hit.unit.clone().unwrap_or_default(),
+        "offset" => hit.offset.clone().unwrap_or_default(),
+        "scaling" => hit.scaling.clone().unwrap_or_default(),
+        "source_file" => hit.source_file.clone(),
+        _ => String::new(),
+    }
+}
+
 async fn search_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<SearchQuery>,
@@ -366,7 +398,6 @@ async fn search_handler(
 
     let index = state.index.read().unwrap();
     let all_results = search(&index, &q, &filter);
-    let total = all_results.len();
 
     // Compute filter counts and unique column values from ALL matching results (before pagination)
     let mut bus_type_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -423,12 +454,51 @@ async fn search_handler(
         col_vals.get_mut("source_file").unwrap().insert(hit.source_file.clone());
     }
 
+    // Only include column values for columns with <= 500 unique values
+    // (high-cardinality columns like signal_name would bloat the response)
+    const MAX_UNIQUE_VALUES: usize = 500;
     let column_values: HashMap<String, Vec<String>> = col_vals
         .into_iter()
+        .filter(|(_, v)| v.len() <= MAX_UNIQUE_VALUES)
         .map(|(k, v)| (k.to_string(), v.into_iter().collect()))
         .collect();
 
-    let page: Vec<SearchHit> = all_results.into_iter().skip(offset).take(limit).collect();
+    // Apply column-level filters (text search + set filters) BEFORE pagination
+    let text_filters: HashMap<String, String> = params
+        .col_text_filters
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    let set_filters: HashMap<String, Vec<String>> = params
+        .col_set_filters
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+
+    let has_col_filters = !text_filters.is_empty() || !set_filters.is_empty();
+
+    let filtered_results: Vec<SearchHit> = if has_col_filters {
+        all_results.into_iter().filter(|hit| {
+            // Text filters
+            for (col_key, search_text) in &text_filters {
+                let needle = search_text.to_lowercase();
+                if needle.is_empty() { continue; }
+                let haystack = get_hit_field(hit, col_key).to_lowercase();
+                if !haystack.contains(&needle) { return false; }
+            }
+            // Set filters
+            for (col_key, allowed) in &set_filters {
+                let val = get_hit_field(hit, col_key);
+                if !allowed.contains(&val) { return false; }
+            }
+            true
+        }).collect()
+    } else {
+        all_results
+    };
+
+    let total = filtered_results.len();
+    let page: Vec<SearchHit> = filtered_results.into_iter().skip(offset).take(limit).collect();
 
     Json(SearchResponse {
         query: q,

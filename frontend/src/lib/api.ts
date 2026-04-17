@@ -102,7 +102,8 @@ export async function importFiles(files: File[]): Promise<ImportResponse> {
 export async function searchSignals(
   query: string,
   filters?: { platform?: string; bus?: string; bus_name?: string; file_type?: string },
-  pagination?: { limit?: number; offset?: number }
+  pagination?: { limit?: number; offset?: number },
+  columnFilters?: { textFilters?: Record<string, string>; setFilters?: Record<string, string[]> }
 ): Promise<SearchResponse> {
   const params = new URLSearchParams();
   if (query) params.set("q", query);
@@ -112,6 +113,12 @@ export async function searchSignals(
   if (filters?.file_type) params.set("file_type", filters.file_type);
   if (pagination?.limit) params.set("limit", String(pagination.limit));
   if (pagination?.offset) params.set("offset", String(pagination.offset));
+  if (columnFilters?.textFilters && Object.keys(columnFilters.textFilters).length > 0) {
+    params.set("col_text_filters", JSON.stringify(columnFilters.textFilters));
+  }
+  if (columnFilters?.setFilters && Object.keys(columnFilters.setFilters).length > 0) {
+    params.set("col_set_filters", JSON.stringify(columnFilters.setFilters));
+  }
 
   const res = await fetch(`${API_BASE}/api/search?${params}`);
   if (!res.ok) throw new Error(`Search failed: ${res.statusText}`);
