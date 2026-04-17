@@ -384,6 +384,7 @@ export default function ManageImportsPage() {
               accept=".zip,application/zip"
               onChange={(e) => {
                 if (e.target.files && e.target.files.length > 0) {
+                  setProgressMsg(`Uploading ${e.target.files.length} .zip file(s)…`);
                   setTimeout(() => handleFileUpload(e.target.files!), 0);
                 }
               }}

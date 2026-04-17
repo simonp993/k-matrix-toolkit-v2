@@ -285,7 +285,7 @@ fn extract_zip_archive(
 
         let mut out_file = std::fs::File::create(&dest_path)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        std::io::copy(&mut entry.by_ref().take((MAX_UPLOAD_SIZE + 1) as u64), &mut out_file)
+        std::io::copy(&mut entry.by_ref().take(entry_size as u64), &mut out_file)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         extracted_count += 1;
