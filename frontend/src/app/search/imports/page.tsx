@@ -27,6 +27,7 @@ export default function ManageImportsPage() {
   const [dragOver, setDragOver] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
+  const zipInputRef = useRef<HTMLInputElement>(null);
 
   /* -- Import table columns ------------------------------------------- */
 
@@ -72,10 +73,11 @@ export default function ManageImportsPage() {
         (f) =>
           f.name.endsWith(".xlsx") ||
           f.name.endsWith(".dbc") ||
-          f.name.endsWith(".ldf")
+          f.name.endsWith(".ldf") ||
+          f.name.endsWith(".zip")
       );
       if (supported.length === 0) {
-        setError("No supported files (.xlsx, .dbc, .ldf).");
+        setError("No supported files (.xlsx, .dbc, .ldf, .zip).");
         setProgressMsg(null);
         setLoading(false);
         return;
@@ -154,12 +156,20 @@ export default function ManageImportsPage() {
       if (items && items.length > 0) {
         const allFiles: File[] = [];
         let hasDirectory = false;
+        let hasZipFile = false;
         setLoading(true);
         setProgressMsg("Scanning folder\u2026");
         scanCountRef.current = 0;
         for (let i = 0; i < items.length; i++) {
           const entry = items[i].webkitGetAsEntry?.();
-          if (!entry) continue;
+          if (!entry) {
+            const droppedFile = items[i].getAsFile();
+            if (droppedFile && droppedFile.name.toLowerCase().endsWith(".zip")) {
+              hasZipFile = true;
+              allFiles.push(droppedFile);
+            }
+            continue;
+          }
           try {
             if (entry.isDirectory) {
               hasDirectory = true;
@@ -167,8 +177,13 @@ export default function ManageImportsPage() {
                 entry as FileSystemDirectoryEntry
               );
               allFiles.push(...dirFiles);
+            } else if (entry.isFile) {
+              const droppedFile = items[i].getAsFile();
+              if (droppedFile && droppedFile.name.toLowerCase().endsWith(".zip")) {
+                hasZipFile = true;
+                allFiles.push(droppedFile);
+              }
             }
-            // skip individual files — only folders accepted
           } catch (err) {
             console.warn("Failed to read dropped entry:", entry.name, err);
           }
@@ -181,10 +196,12 @@ export default function ManageImportsPage() {
         setLoading(false);
         if (hasDirectory) {
           setError(
-            "No supported files (.xlsx, .dbc, .ldf) found in the dropped folder."
+            "No supported files (.xlsx, .dbc, .ldf, .zip) found in the dropped folder."
           );
+        } else if (hasZipFile) {
+          setError("No supported files found in dropped .zip archive.");
         } else {
-          setError("Please drop a folder, not individual files.");
+          setError("Please drop a folder or .zip file.");
         }
       }
     },
@@ -327,18 +344,26 @@ export default function ManageImportsPage() {
           <div className="flex flex-col items-center gap-3">
             <div className="text-3xl">{"\uD83D\uDCC2"}</div>
             <PText weight="bold">
-              Drag &amp; drop K-Matrix folders here
+              Drag &amp; drop K-Matrix folders or .zip archives here
             </PText>
             <PText color="contrast-medium" size="small">
-              Supported files: .xlsx &middot; .dbc &middot; .ldf
+              Supported files: .xlsx &middot; .dbc &middot; .ldf &middot; .zip
             </PText>
 
-            <PButton
-              variant="secondary"
-              onClick={() => folderInputRef.current?.click()}
-            >
-              Browse Folder
-            </PButton>
+            <div className="flex flex-wrap items-center justify-center gap-2">
+              <PButton
+                variant="secondary"
+                onClick={() => folderInputRef.current?.click()}
+              >
+                Browse Folder
+              </PButton>
+              <PButton
+                variant="secondary"
+                onClick={() => zipInputRef.current?.click()}
+              >
+                Upload ZIP
+              </PButton>
+            </div>
             <input
               ref={folderInputRef}
               type="file"
@@ -348,6 +373,18 @@ export default function ManageImportsPage() {
                 if (e.target.files && e.target.files.length > 0) {
                   setProgressMsg(`Reading ${e.target.files.length} files from folder\u2026`);
                   // Use setTimeout to let React render the progress message
+                  setTimeout(() => handleFileUpload(e.target.files!), 0);
+                }
+              }}
+            />
+            <input
+              ref={zipInputRef}
+              type="file"
+              className="hidden"
+              accept=".zip,application/zip"
+              onChange={(e) => {
+                if (e.target.files && e.target.files.length > 0) {
+                  setProgressMsg(`Uploading ${e.target.files.length} .zip file(s)…`);
                   setTimeout(() => handleFileUpload(e.target.files!), 0);
                 }
               }}

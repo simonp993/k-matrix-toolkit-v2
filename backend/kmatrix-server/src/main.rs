@@ -3,7 +3,7 @@
 //! Axum HTTP server exposing a REST API for importing K-Matrices
 //! and searching across them. State is persisted to disk.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use axum::extract::{DefaultBodyLimit, Multipart, Path as AxumPath, Query, State};
@@ -216,6 +216,84 @@ async fn import_directory(
 
 const MAX_UPLOAD_SIZE: usize = 500 * 1024 * 1024; // 500 MB total
 
+fn is_supported_matrix_file(file_name: &str) -> bool {
+    let lower = file_name.to_lowercase();
+    lower.ends_with(".xlsx") || lower.ends_with(".dbc") || lower.ends_with(".ldf")
+}
+
+fn is_supported_upload_file(file_name: &str) -> bool {
+    is_supported_matrix_file(file_name) || file_name.to_lowercase().ends_with(".zip")
+}
+
+fn add_to_total_size(total_size: &mut usize, additional_bytes: usize) -> Result<(), (StatusCode, String)> {
+    *total_size = total_size
+        .checked_add(additional_bytes)
+        .ok_or_else(|| (StatusCode::PAYLOAD_TOO_LARGE, "Upload exceeds 500 MB limit".to_string()))?;
+    if *total_size > MAX_UPLOAD_SIZE {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Upload exceeds 500 MB limit".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn extract_zip_archive(
+    zip_bytes: &[u8],
+    dest_root: &Path,
+    total_size: &mut usize,
+) -> Result<usize, (StatusCode, String)> {
+    use std::io::{Cursor, Read};
+
+    let cursor = Cursor::new(zip_bytes);
+    let mut archive = zip::ZipArchive::new(cursor)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid zip archive: {e}")))?;
+
+    let mut extracted_count = 0usize;
+
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("Failed reading zip entry: {e}")))?;
+
+        if entry.is_dir() {
+            continue;
+        }
+
+        let Some(enclosed_name) = entry.enclosed_name().map(|p| p.to_owned()) else {
+            continue;
+        };
+
+        let entry_name = enclosed_name.to_string_lossy();
+        if !is_supported_matrix_file(&entry_name) {
+            continue;
+        }
+
+        let entry_size: usize = entry.size().try_into().map_err(|_| {
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Zip entry is too large".to_string(),
+            )
+        })?;
+        add_to_total_size(total_size, entry_size)?;
+
+        let dest_path = dest_root.join(enclosed_name);
+        if let Some(parent) = dest_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+
+        let mut out_file = std::fs::File::create(&dest_path)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        std::io::copy(&mut entry.by_ref().take(entry_size as u64), &mut out_file)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        extracted_count += 1;
+    }
+
+    Ok(extracted_count)
+}
+
 async fn upload_files(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
@@ -224,7 +302,8 @@ async fn upload_files(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let mut total_size: usize = 0;
-    let mut file_count: usize = 0;
+    let mut upload_item_count: usize = 0;
+    let mut supported_file_count: usize = 0;
 
     while let Some(field) = multipart
         .next_field()
@@ -237,11 +316,7 @@ async fn upload_files(
             .unwrap_or_default();
 
         // Only accept supported formats
-        let lower = file_name.to_lowercase();
-        if !lower.ends_with(".xlsx")
-            && !lower.ends_with(".dbc")
-            && !lower.ends_with(".ldf")
-        {
+        if !is_supported_upload_file(&file_name) {
             continue;
         }
 
@@ -250,31 +325,32 @@ async fn upload_files(
             .await
             .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
-        total_size += data.len();
-        if total_size > MAX_UPLOAD_SIZE {
-            return Err((
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "Upload exceeds 500 MB limit".to_string(),
-            ));
+        upload_item_count += 1;
+
+        if file_name.to_lowercase().ends_with(".zip") {
+            let extracted = extract_zip_archive(&data, temp_dir.path(), &mut total_size)?;
+            supported_file_count += extracted;
+            continue;
         }
+        add_to_total_size(&mut total_size, data.len())?;
 
         // Sanitize filename: only keep the basename, no path traversal
         let safe_name = std::path::Path::new(&file_name)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| format!("upload_{file_count}"));
+            .unwrap_or_else(|| format!("upload_{upload_item_count}"));
 
         let dest = temp_dir.path().join(&safe_name);
         tokio::fs::write(&dest, &data)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        file_count += 1;
+        supported_file_count += 1;
     }
 
-    if file_count == 0 {
+    if supported_file_count == 0 {
         return Err((
             StatusCode::BAD_REQUEST,
-            "No supported files uploaded (.xlsx, .dbc, .ldf)".to_string(),
+            "No supported files uploaded (.xlsx, .dbc, .ldf, .zip)".to_string(),
         ));
     }
 
@@ -573,6 +649,8 @@ async fn clear_matrices(
 mod tests {
     use super::*;
 
+    use std::io::Write;
+
     use axum::body::Body;
     use axum::http::{Request, StatusCode as AxumStatusCode};
     use bytes::Bytes;
@@ -656,6 +734,35 @@ mod tests {
         }
     }
 
+    const MINIMAL_DBC: &str = r#"
+VERSION ""
+
+NS_ :
+
+BS_:
+
+BU_: ECU1 ECU2
+
+BO_ 256 TestMsg: 8 ECU1
+ SG_ CRC_Signal : 0|8@1+ (1,0) [0|255] "unit" ECU2
+ SG_ Counter_Signal : 8|4@1+ (1,0) [0|15] "" ECU1,ECU2
+
+"#;
+
+    fn build_zip_with_files(entries: &[(&str, &str)]) -> Vec<u8> {
+        let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut cursor);
+            let options = zip::write::SimpleFileOptions::default();
+            for (name, contents) in entries {
+                zip.start_file(name, options).unwrap();
+                zip.write_all(contents.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        cursor.into_inner()
+    }
+
     /// Send a GET request and return the response body bytes.
     async fn get_body(app: Router, uri: &str) -> (AxumStatusCode, Bytes) {
         let resp = app
@@ -681,6 +788,32 @@ mod tests {
                     .uri(uri)
                     .header("content-type", "application/json")
                     .body(Body::from(json.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, body)
+    }
+
+    /// Send a POST request with multipart/form-data body and return the response.
+    async fn post_multipart(
+        app: Router,
+        uri: &str,
+        body: Vec<u8>,
+        boundary: &str,
+    ) -> (AxumStatusCode, Bytes) {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
                     .unwrap(),
             )
             .await
@@ -932,6 +1065,50 @@ mod tests {
         assert_eq!(status, AxumStatusCode::OK);
         let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(val["cleared"], 1);
+    }
+
+    // ── ZIP upload support ───────────────────────────────────────────
+
+    #[test]
+    fn extract_zip_archive_extracts_supported_files_only() {
+        let zip_data = build_zip_with_files(&[
+            ("nested/test_matrix.dbc", MINIMAL_DBC),
+            ("nested/readme.txt", "ignore me"),
+        ]);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut total_size = 0usize;
+
+        let extracted = extract_zip_archive(&zip_data, temp_dir.path(), &mut total_size).unwrap();
+        assert_eq!(extracted, 1);
+        assert!(temp_dir.path().join("nested/test_matrix.dbc").exists());
+        assert!(!temp_dir.path().join("nested/readme.txt").exists());
+        assert_eq!(total_size, MINIMAL_DBC.len());
+    }
+
+    #[tokio::test]
+    async fn upload_zip_with_supported_files() {
+        let state = test_state(vec![]);
+        let app = build_router(state);
+
+        let zip_data = build_zip_with_files(&[("folder/test_matrix.dbc", MINIMAL_DBC)]);
+        let boundary = "KMATRIX_BOUNDARY";
+        let mut multipart_body = Vec::<u8>::new();
+        multipart_body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"files\"; filename=\"kmatrix.zip\"\r\nContent-Type: application/zip\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        multipart_body.extend_from_slice(&zip_data);
+        multipart_body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+        let (status, body) = post_multipart(app, "/api/upload", multipart_body, boundary).await;
+        assert_eq!(status, AxumStatusCode::OK);
+
+        let resp: ImportResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.files_imported, 1);
+        assert_eq!(resp.total_matrices, 1);
+        assert_eq!(resp.total_signals, 2);
     }
 
     // ── POST /api/import (error cases) ──────────────────────────────
